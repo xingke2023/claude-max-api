@@ -1,0 +1,22 @@
+[Unit]
+Description=Claude Max Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/claude-max-proxy
+Environment=HOME=/home/ubuntu
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PORT=8899
+Environment=HOST=127.0.0.1
+EnvironmentFile=/home/ubuntu/claude-max-proxy/.env
+ExecStart=/home/ubuntu/claude-max-proxy/.venv/bin/gunicorn --bind 127.0.0.1:8899 --workers 1 --threads 8 --timeout 420 --access-logfile - proxy:app
+Restart=always
+RestartSec=3
+StandardOutput=append:/home/ubuntu/claude-max-proxy/proxy.log
+StandardError=append:/home/ubuntu/claude-max-proxy/proxy.log
+
+[Install]
+WantedBy=multi-user.target

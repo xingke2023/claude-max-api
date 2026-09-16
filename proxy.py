@@ -3,11 +3,7 @@
 Claude Max → Standard API 代理网关 v3
 基于 Neo (linux.do) 的逆向方案 + mitmproxy 抓包验证
 
-关键发现：
-1. 认证用 Authorization: Bearer <oauth-token>
-2. 必须带 anthropic-beta: oauth-2025-04-20
-3. Anthropic 通过扫描请求 body 中的 "OpenClaw" 关键词检测第三方应用
-4. 替换该关键词即可绕过检测，使用订阅额度
+提供 OAuth 转发、工具映射和 SSE 流式响应。
 """
 
 import json
@@ -15,6 +11,11 @@ import os
 import sys
 import time
 import uuid
+import hmac
+import ipaddress
+import subprocess
+import threading
+import tempfile
 
 import xxhash
 import requests
@@ -27,7 +28,49 @@ app = Flask(__name__)
 # ============================================================
 
 DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
-PORT = int(os.environ.get("PORT", "5678"))
+PORT = int(os.environ.get("PORT", "8899"))
+HOST = os.environ.get("HOST", "127.0.0.1")
+PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
+SYSTEM_PROMPT_MODE = os.environ.get("SYSTEM_PROMPT_MODE", "legacy")
+REFRESH_TIMEOUT = float(os.environ.get("REFRESH_TIMEOUT", "60"))
+UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "300"))
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
+if SYSTEM_PROMPT_MODE not in {"legacy", "preserve"}:
+    raise ValueError("SYSTEM_PROMPT_MODE must be legacy or preserve")
+try:
+    _loopback = ipaddress.ip_address(HOST).is_loopback
+except ValueError:
+    _loopback = HOST == "localhost"
+if not _loopback and not PROXY_API_KEY:
+    raise ValueError("PROXY_API_KEY is required when HOST is not loopback")
+_REFRESH_LOCK = threading.Lock()
+
+
+def api_error(message, status, error_type="api_error"):
+    return {"type": "error", "error": {"type": error_type, "message": message}}, status
+
+
+@app.before_request
+def authenticate():
+    if PROXY_API_KEY:
+        supplied = request.headers.get("x-api-key", "")
+        if not supplied:
+            auth = request.headers.get("Authorization", "")
+            supplied = auth[7:] if auth.startswith("Bearer ") else ""
+        if not hmac.compare_digest(supplied.encode(), PROXY_API_KEY.encode()):
+            return api_error("Invalid proxy API key", 401, "authentication_error")
+
+
+@app.errorhandler(413)
+def request_too_large(error):
+    return api_error("Request body exceeds 32 MiB", 413, "invalid_request_error")
+
+
+def dump_debug(data):
+    # Unique files with owner-only permissions; concurrent requests cannot overwrite them.
+    with tempfile.NamedTemporaryFile(prefix="claude-proxy-", suffix=".json", delete=False) as f:
+        f.write(data)
+
 
 CLAUDE_DIR = os.path.expanduser("~/.claude")
 CREDENTIALS_FILE = os.path.join(CLAUDE_DIR, ".credentials.json")
@@ -57,6 +100,8 @@ def detect_cc_version():
     return main_ver, build_num
 
 CC_VERSION, CC_BUILD = detect_cc_version()
+CC_VERSION = os.environ.get("CC_VERSION", CC_VERSION)
+CC_BUILD = os.environ.get("CC_BUILD", CC_BUILD)
 CC_FULL_VERSION = f"{CC_VERSION}.{CC_BUILD}"
 
 # ============================================================
@@ -65,17 +110,34 @@ CC_FULL_VERSION = f"{CC_VERSION}.{CC_BUILD}"
 
 def load_credentials():
     with open(CREDENTIALS_FILE) as f:
-        return json.load(f)["claudeAiOauth"]
+        data = json.load(f)
+    cred = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if (not isinstance(cred, dict) or not isinstance(cred.get("expiresAt"), (int, float))
+            or not isinstance(cred.get("accessToken"), str) or not cred["accessToken"]):
+        raise ValueError("Invalid OAuth credential format")
+    return cred
+
+class CredentialError(Exception):
+    pass
+
 
 def get_access_token():
-    cred = load_credentials()
-    expires_at = cred.get("expiresAt", 0)
-    if time.time() * 1000 > expires_at - 300_000:
-        sys.stdout.write("[proxy] Token expiring, refreshing via claude --print...\n")
-        sys.stdout.flush()
-        os.system('claude --print "ping" > /dev/null 2>&1')
-        cred = load_credentials()
-    return cred["accessToken"]
+    # Re-read inside the lock so concurrent requests share one refresh.
+    with _REFRESH_LOCK:
+        try:
+            cred = load_credentials()
+            if time.time() * 1000 > cred.get("expiresAt", 0) - 300_000:
+                subprocess.run(
+                    ["claude", "--print", "ping"], check=True,
+                    timeout=REFRESH_TIMEOUT, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                cred = load_credentials()
+            if cred.get("expiresAt", 0) <= time.time() * 1000 or not cred.get("accessToken"):
+                raise CredentialError("OAuth credentials are expired or missing")
+            return cred["accessToken"]
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+            raise CredentialError("Unable to load or refresh OAuth credentials") from exc
 
 # ============================================================
 # cch 签名计算
@@ -85,104 +147,113 @@ def compute_cch(body_bytes: bytes) -> str:
     h = xxhash.xxh64(body_bytes, seed=CCH_SEED).intdigest()
     return f"{h & 0xFFFFF:05x}"
 
-# ============================================================
-# 被 Anthropic 屏蔽的第三方应用关键词
-# ============================================================
-
-BLOCKED_KEYWORDS = [
-    ("OpenClaw", "Claude Code"),
-    ("openclaw", "claude_code"),
-    ("open_claw", "claude_code"),
-    ("open-claw", "claude-code"),
-]
-
-# 不应被替换的模式（占位保护）
-# 替换这些会导致 tool 调用失败、命令执行出错、URL 不可达等问题
-import re
-_PROTECT_PLACEHOLDER = "__OCPROT_{}_TORPCO__"
-_PROTECT_PATTERNS = [
-    # 文件路径: /home/xxx/.openclaw/workspace-daliu/, ~/.openclaw/media/
-    re.compile(r'(/[\w.~/-]*)\.openclaw(/[\w.~/-]*)'),
-    # npm 模块路径: node_modules/openclaw/
-    re.compile(r'node_modules/openclaw'),
-    # channel 标识符: openclaw-weixin
-    re.compile(r'openclaw-weixin'),
-]
-
-def sanitize_body(body_str: str) -> str:
-    """替换被 Anthropic 屏蔽的第三方应用关键词，但保护路径/命令/URL/标识符不被篡改"""
-    # 1. 收集所有需要保护的文本片段
-    placeholders = []
-    for pattern in _PROTECT_PATTERNS:
-        for m in pattern.finditer(body_str):
-            placeholders.append(m.group())
-    # 去重并按长度降序（先替换长的，避免子串冲突）
-    placeholders = sorted(set(placeholders), key=len, reverse=True)
-    for i, ph in enumerate(placeholders):
-        body_str = body_str.replace(ph, _PROTECT_PLACEHOLDER.format(i))
-
-    # 2. 执行关键词替换
-    for old, new in BLOCKED_KEYWORDS:
-        body_str = body_str.replace(old, new)
-
-    # 3. 恢复占位符为原始文本
-    for i, ph in enumerate(placeholders):
-        body_str = body_str.replace(_PROTECT_PLACEHOLDER.format(i), ph)
-
-    return body_str
-
-# ============================================================
-# 请求体处理
-# ============================================================
-
-# 加载 tool 名称映射表
+# 工具名称配置；仅映射名称，不删除或注入客户端未声明的工具。
 _MAPPING_FILE = os.path.join(os.path.dirname(__file__), "tool_name_mapping.json")
 with open(_MAPPING_FILE) as _f:
     _mapping = json.load(_f)
-
-REMOVE_TOOLS = set(_mapping["_remove"])
-PADDING_TOOLS = _mapping.get("_padding", [])
 OC_TO_CC = {**_mapping["direct"], **_mapping["borrowed"]}
-CC_TO_OC = {v: k for k, v in OC_TO_CC.items()}
 
-# 加载 CC tool baseline 用于 padding（指纹补齐）
-_BASELINE_FILE = os.path.join(os.path.dirname(__file__), "cc_tools_baseline.json")
-with open(_BASELINE_FILE) as _f:
-    _baseline = json.load(_f)
-_BASELINE_BY_NAME = {t["name"]: t for t in _baseline}
 
-def replace_tools(body: dict) -> None:
-    """替换 tool 名称：移除不需要的，把 OC 名改成 CC 名，保留原始 schema。
-    末尾追加 padding tools（用 CC 真实 schema），让指纹更接近真实 CC。"""
-    tools = body.get("tools")
-    if not tools:
-        return
+def replace_tools(body: dict) -> dict:
+    """Map definitions, history and tool_choice consistently, per request."""
+    reverse = {}
 
-    new_tools = []
-    used_cc_names = set()
-    for t in tools:
-        name = t.get("name")
-        if name in REMOVE_TOOLS:
-            continue
-        if name in OC_TO_CC:
-            t = {**t, "name": OC_TO_CC[name]}
-        new_tools.append(t)
-        used_cc_names.add(t["name"])
+    def register(name):
+        if not isinstance(name, str) or not name:
+            raise ValueError("Tool names must be non-empty strings")
+        mapped = OC_TO_CC.get(name, name)
+        if mapped in reverse and reverse[mapped] != name:
+            raise ValueError(f"Tool name collision: {name} and {reverse[mapped]}")
+        reverse[mapped] = name
+        return mapped
 
-    # 追加 padding：CC 新工具用真实 schema 注入，第三方客户端不会调用
-    padding_added = []
-    for cc_name in PADDING_TOOLS:
-        if cc_name in used_cc_names:
-            continue
-        if cc_name not in _BASELINE_BY_NAME:
-            continue
-        new_tools.append(_BASELINE_BY_NAME[cc_name])
-        padding_added.append(cc_name)
+    tools = body.get("tools", [])
+    if not isinstance(tools, list):
+        raise ValueError("tools must be an array")
+    seen = set()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            raise ValueError("Each tool must be an object")
+        name = tool.get("name")
+        if not isinstance(name, str) or name in seen:
+            raise ValueError("Tool names must be strings and unique")
+        seen.add(name)
+        tool["name"] = register(name)
 
-    body["tools"] = new_tools
-    sys.stdout.write(f"[proxy] tools: {len(new_tools)} total (mapped from {len(tools)}, padded +{len(padding_added)}={padding_added}), "
-                     f"names={[t['name'] for t in new_tools]}\n")
-    sys.stdout.flush()
+    for msg in body["messages"]:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    raise ValueError("Message content blocks must be objects")
+                if block.get("type") == "tool_use":
+                    block["name"] = register(block.get("name"))
+
+    choice = body.get("tool_choice")
+    if choice is not None:
+        if not isinstance(choice, dict):
+            raise ValueError("tool_choice must be an object")
+        if choice.get("type") == "tool":
+            name = choice.get("name")
+            if not isinstance(name, str) or name not in seen:
+                raise ValueError("tool_choice must reference a declared tool")
+            choice["name"] = register(name)
+    # Do not remove client tools or inject tools the client cannot execute.
+    return reverse
+
+
+def remap_response(data, reverse):
+    """Only modify protocol tool-use blocks, never arbitrary tool input or text."""
+    if not isinstance(data, dict):
+        return data
+    blocks = data.get("content", [])
+    if isinstance(blocks, list):
+        for block in blocks:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                block["name"] = reverse.get(block.get("name"), block.get("name"))
+    block = data.get("content_block")
+    if isinstance(block, dict) and block.get("type") == "tool_use":
+        block["name"] = reverse.get(block.get("name"), block.get("name"))
+    return data
+
+
+def stream_events(resp, reverse):
+    # Buffer bytes through complete SSE lines/events before UTF-8 decoding.
+    pending = b""
+    lines = []
+
+    def encode_event(event_lines):
+        data_lines = [line[5:].lstrip(b" ") for line in event_lines if line.startswith(b"data:")]
+        if not data_lines:
+            return b"\n".join(event_lines) + b"\n\n"
+        try:
+            data = json.loads(b"\n".join(data_lines))
+        except (ValueError, UnicodeError):
+            return b"\n".join(event_lines) + b"\n\n"
+        mapped = json.dumps(remap_response(data, reverse), ensure_ascii=False).encode("utf-8")
+        other = [line for line in event_lines if not line.startswith(b"data:")]
+        return b"\n".join(other + [b"data: " + mapped]) + b"\n\n"
+
+    try:
+        for chunk in resp.iter_content(chunk_size=4096):
+            pending += chunk
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                line = line.rstrip(b"\r")
+                if line:
+                    lines.append(line)
+                else:
+                    yield encode_event(lines)
+                    lines = []
+        if pending or lines:
+            # An incomplete event cannot safely be delivered as a successful response.
+            raise requests.ConnectionError("Truncated SSE event")
+    except requests.RequestException:
+        data = {"type": "error", "error": {"type": "api_error", "message": "Upstream stream interrupted"}}
+        yield ("event: error\ndata: " + json.dumps(data) + "\n\n").encode()
+    finally:
+        resp.close()
+
 
 def inject_system_and_cch(body: dict) -> bytes:
     """注入 Claude Code 的 system prompts + 计算 cch 签名
@@ -190,6 +261,9 @@ def inject_system_and_cch(body: dict) -> bytes:
     核心策略：把 openclaw 的 system prompt 移到第一条 user message 里，
     system 参数只保留标准 Claude Code 格式，避免被 Anthropic 检测。
     """
+    if SYSTEM_PROMPT_MODE == "preserve":
+        return json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
     # 提取原始 system prompt
     original_system = body.get("system", [])
     if isinstance(original_system, str):
@@ -234,9 +308,6 @@ def inject_system_and_cch(body: dict) -> bytes:
 
     body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
-    # 关键词替换已禁用——依赖 tool name 映射 + system prompt 移动来绕过检测
-    # body_str = sanitize_body(body_str)
-
     body_bytes = body_str.encode("utf-8")
 
     cch = compute_cch(body_bytes)
@@ -274,87 +345,91 @@ def build_headers(access_token: str) -> dict:
 @app.route("/v1/messages", methods=["POST"])
 def proxy_messages():
     try:
-        raw = request.get_data(as_text=True)
+        raw = request.get_data()
         body = json.loads(raw)
-    except Exception as e:
-        return {"error": str(e)}, 400
+        if not isinstance(body, dict):
+            raise ValueError("Request must be a JSON object")
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("messages must be a non-empty array")
+        for index, msg in enumerate(messages):
+            # Validate only what this proxy needs to process. The upstream owns
+            # message role/content semantics, including new client extensions.
+            if not isinstance(msg, dict):
+                raise ValueError(f"messages[{index}] must be an object")
+            if not isinstance(msg.get("role"), str) or not msg["role"]:
+                raise ValueError(f"messages[{index}].role must be a non-empty string")
+        if not isinstance(body.get("model"), str) or not body["model"]:
+            raise ValueError("model must be a non-empty string")
+        if not isinstance(body.get("stream", False), bool):
+            raise ValueError("stream must be a boolean")
+        system = body.get("system", [])
+        if not isinstance(system, (str, list)) or (isinstance(system, list) and any(
+            not isinstance(block, dict) or block.get("type") != "text"
+            or not isinstance(block.get("text"), str) for block in system
+        )):
+            raise ValueError("system must be a string or an array of text blocks")
+        if SYSTEM_PROMPT_MODE == "legacy" and system and not any(m["role"] == "user" for m in messages):
+            raise ValueError("Legacy system migration requires a user message")
+        reverse = replace_tools(body)
+        body_bytes = inject_system_and_cch(body)
+    except (ValueError, UnicodeError) as exc:
+        return api_error(str(exc), 400, "invalid_request_error")
 
-    access_token = get_access_token()
-
+    try:
+        access_token = get_access_token()
+    except CredentialError:
+        return api_error("OAuth credentials unavailable; check local Claude login", 503)
     if DEBUG:
-        if len(raw) > 1000:
-            with open("/tmp/proxy_neo_raw.json", "w") as df:
-                df.write(raw)
-
-    replace_tools(body)
-    body_bytes = inject_system_and_cch(body)
+        dump_debug(raw)
+        dump_debug(body_bytes)
     headers = build_headers(access_token)
-
-    if DEBUG:
-        with open("/tmp/proxy_neo_last.json", "wb") as df:
-            df.write(body_bytes)
-
     is_stream = body.get("stream", False)
     if is_stream:
         headers["Accept"] = "text/event-stream"
+    try:
+        resp = requests.post(
+            f"{UPSTREAM}/v1/messages?beta=true", data=body_bytes,
+            headers=headers, stream=is_stream, timeout=(10, UPSTREAM_TIMEOUT),
+        )
+    except requests.Timeout:
+        return api_error("Upstream request timed out", 504)
+    except requests.RequestException:
+        return api_error("Unable to connect to upstream", 502)
 
-    sys.stdout.write(f"[proxy] → {UPSTREAM}/v1/messages?beta=true "
-          f"model={body.get('model', '?')} stream={is_stream} "
-          f"body_size={len(body_bytes)}\n")
-    sys.stdout.flush()
-
-    resp = requests.post(
-        f"{UPSTREAM}/v1/messages?beta=true",
-        data=body_bytes,
-        headers=headers,
-        stream=is_stream,
-        timeout=300,
-    )
-
-    sys.stdout.write(f"[proxy] ← status={resp.status_code}\n")
-    if resp.status_code >= 400:
+    if is_stream and resp.status_code < 400 and "text/event-stream" in resp.headers.get("content-type", ""):
+        response = Response(
+            stream_with_context(stream_events(resp, reverse)), status=resp.status_code,
+            content_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+        response.call_on_close(resp.close)
+        return response
+    try:
+        content = resp.content
         try:
-            sys.stdout.write(f"[proxy] ← error: {resp.text[:500]}\n")
-        except:
+            content = json.dumps(remap_response(json.loads(content), reverse), ensure_ascii=False).encode("utf-8")
+        except (ValueError, UnicodeError):
             pass
-    sys.stdout.flush()
-
-    def remap_tool_names(data: bytes) -> bytes:
-        """把响应中的 CC tool 名替换回 OC tool 名"""
-        text = data.decode("utf-8", errors="replace")
-        for cc_name, oc_name in CC_TO_OC.items():
-            text = text.replace(f'"name":"{cc_name}"', f'"name":"{oc_name}"')
-            text = text.replace(f'"name": "{cc_name}"', f'"name": "{oc_name}"')
-        return text.encode("utf-8")
-
-    if is_stream:
-        def generate():
-            for chunk in resp.iter_content(chunk_size=None):
-                if chunk:
-                    yield remap_tool_names(chunk)
-        return Response(
-            stream_with_context(generate()),
-            status=resp.status_code,
-            content_type=resp.headers.get("content-type", "text/event-stream"),
-        )
-    else:
-        excluded = {"transfer-encoding", "content-encoding", "content-length", "connection"}
+        excluded = {"transfer-encoding", "content-encoding", "content-length", "connection",
+                    "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade"}
+        excluded.update(h.strip().lower() for h in resp.headers.get("connection", "").split(","))
         resp_headers = {k: v for k, v in resp.headers.items() if k.lower() not in excluded}
-        return Response(
-            remap_tool_names(resp.content),
-            status=resp.status_code,
-            headers=resp_headers,
-            content_type=resp.headers.get("content-type", "application/json"),
-        )
+        return Response(content, status=resp.status_code, headers=resp_headers)
+    except requests.Timeout:
+        return api_error("Upstream response timed out", 504)
+    except requests.RequestException:
+        return api_error("Unable to read upstream response", 502)
+    finally:
+        resp.close()
 
 @app.route("/health")
 def health():
     try:
         cred = load_credentials()
         remaining = (cred.get("expiresAt", 0) / 1000 - time.time()) / 3600
-        return {"status": "ok", "token_hours": round(remaining, 1), "cc_version": CC_FULL_VERSION}
+        return {"status": "ok" if remaining > 0 else "expired", "token_hours": round(remaining, 1), "cc_version": CC_FULL_VERSION}, 200 if remaining > 0 else 503
     except Exception as e:
-        return {"status": "error", "error": str(e)}, 500
+        return api_error("OAuth credentials unavailable", 503)
 
 if __name__ == "__main__":
     print(f"=== Claude Max → API 代理网关 v3 ===")
@@ -371,8 +446,8 @@ if __name__ == "__main__":
         print("❌ Claude Code credentials not found!")
         sys.exit(1)
     print()
-    print(f"🚀 http://localhost:{PORT}")
+    print(f"🚀 http://{HOST}:{PORT}")
     if DEBUG:
         print(f"🔍 DEBUG mode ON (request dumps → /tmp/)")
     print()
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    app.run(host=HOST, port=PORT, debug=False)
