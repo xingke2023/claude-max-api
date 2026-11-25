@@ -31,7 +31,18 @@ DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
 PORT = int(os.environ.get("PORT", "8899"))
 HOST = os.environ.get("HOST", "127.0.0.1")
 PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
+PROXY_API_KEY_SECONDARY = os.environ.get("PROXY_API_KEY_SECONDARY", "")
 SYSTEM_PROMPT_MODE = os.environ.get("SYSTEM_PROMPT_MODE", "legacy")
+UPSTREAM_PROVIDER = os.environ.get("UPSTREAM_PROVIDER", "oauth")
+FORCE_FAST_OPUS = os.environ.get("FORCE_FAST_OPUS", "").lower() in ("1", "true", "yes")
+FAST_OPUS_MODEL = os.environ.get("FAST_OPUS_MODEL", "claude-opus-5-5")
+FORCE_STANDARD_OPUS = os.environ.get("FORCE_STANDARD_OPUS", "").lower() in ("1", "true", "yes")
+if FORCE_FAST_OPUS and FORCE_STANDARD_OPUS:
+    raise ValueError("Choose either fast or standard Opus")
+if FORCE_FAST_OPUS and UPSTREAM_PROVIDER != "oauth":
+    raise ValueError("FORCE_FAST_OPUS requires the oauth upstream")
+if UPSTREAM_PROVIDER not in {"oauth", "bedrock"}:
+    raise ValueError("UPSTREAM_PROVIDER must be oauth or bedrock")
 REFRESH_TIMEOUT = float(os.environ.get("REFRESH_TIMEOUT", "60"))
 UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "300"))
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
@@ -41,8 +52,8 @@ try:
     _loopback = ipaddress.ip_address(HOST).is_loopback
 except ValueError:
     _loopback = HOST == "localhost"
-if not _loopback and not PROXY_API_KEY:
-    raise ValueError("PROXY_API_KEY is required when HOST is not loopback")
+if not _loopback and not (PROXY_API_KEY or PROXY_API_KEY_SECONDARY):
+    raise ValueError("A proxy API key is required when HOST is not loopback")
 _REFRESH_LOCK = threading.Lock()
 
 
@@ -52,12 +63,14 @@ def api_error(message, status, error_type="api_error"):
 
 @app.before_request
 def authenticate():
-    if PROXY_API_KEY:
+    keys = tuple(key.encode() for key in (PROXY_API_KEY, PROXY_API_KEY_SECONDARY) if key)
+    if keys:
         supplied = request.headers.get("x-api-key", "")
         if not supplied:
             auth = request.headers.get("Authorization", "")
             supplied = auth[7:] if auth.startswith("Bearer ") else ""
-        if not hmac.compare_digest(supplied.encode(), PROXY_API_KEY.encode()):
+        supplied = supplied.encode()
+        if not any([hmac.compare_digest(supplied, key) for key in keys]):
             return api_error("Invalid proxy API key", 401, "authentication_error")
 
 
@@ -157,11 +170,12 @@ OC_TO_CC = {**_mapping["direct"], **_mapping["borrowed"]}
 def replace_tools(body: dict) -> dict:
     """Map definitions, history and tool_choice consistently, per request."""
     reverse = {}
+    server_names = set()
 
     def register(name):
         if not isinstance(name, str) or not name:
             raise ValueError("Tool names must be non-empty strings")
-        mapped = OC_TO_CC.get(name, name)
+        mapped = name if name in server_names else OC_TO_CC.get(name, name)
         if mapped in reverse and reverse[mapped] != name:
             raise ValueError(f"Tool name collision: {name} and {reverse[mapped]}")
         reverse[mapped] = name
@@ -178,7 +192,11 @@ def replace_tools(body: dict) -> dict:
         if not isinstance(name, str) or name in seen:
             raise ValueError("Tool names must be strings and unique")
         seen.add(name)
-        tool["name"] = register(name)
+        if "type" in tool and tool["type"] != "custom":
+            server_names.add(name)
+            register(name)
+        else:
+            tool["name"] = register(name)
 
     for msg in body["messages"]:
         content = msg.get("content")
@@ -261,7 +279,18 @@ def inject_system_and_cch(body: dict) -> bytes:
     核心策略：把 openclaw 的 system prompt 移到第一条 user message 里，
     system 参数只保留标准 Claude Code 格式，避免被 Anthropic 检测。
     """
+    # Respect client-managed breakpoints; otherwise cache the growing history.
+    def has_cache_control(value):
+        if isinstance(value, dict):
+            return "cache_control" in value or any(has_cache_control(v) for v in value.values())
+        if isinstance(value, list):
+            return any(has_cache_control(v) for v in value)
+        return False
+
+    client_caching = has_cache_control(body)
     if SYSTEM_PROMPT_MODE == "preserve":
+        if not client_caching:
+            body["cache_control"] = {"type": "ephemeral"}
         return json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
     # 提取原始 system prompt
@@ -301,10 +330,13 @@ def inject_system_and_cch(body: dict) -> bytes:
     identity = {
         "type": "text",
         "text": "You are Claude Code, Anthropic's official CLI for Claude.",
-        "cache_control": {"type": "ephemeral", "ttl": "1h"},
     }
 
     body["system"] = [billing, identity]
+    # Legacy migration discards system block markers. Enable automatic caching
+    # unless a surviving client marker already manages caching.
+    if not has_cache_control(body):
+        body["cache_control"] = {"type": "ephemeral"}
 
     body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
@@ -319,8 +351,8 @@ def inject_system_and_cch(body: dict) -> bytes:
 # 构造请求头
 # ============================================================
 
-def build_headers(access_token: str) -> dict:
-    return {
+def build_headers(access_token: str, client_beta: str = "") -> dict:
+    headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
@@ -328,7 +360,7 @@ def build_headers(access_token: str) -> dict:
         "X-Claude-Code-Session-Id": str(uuid.uuid4()),
         "x-app": "cli",
         "anthropic-dangerous-direct-browser-access": "true",
-        "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-1m-2025-08-07,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24",
+        "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-1m-2025-08-07,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24" + (",fast-mode-2026-02-01" if FORCE_FAST_OPUS else ""),
         "anthropic-version": "2023-06-01",
         "X-Stainless-Lang": "js",
         "X-Stainless-Package-Version": "0.80.0",
@@ -337,6 +369,13 @@ def build_headers(access_token: str) -> dict:
         "X-Stainless-Runtime": "node",
         "X-Stainless-Runtime-Version": "v24.3.0",
     }
+
+    # Preserve every client beta, including unknown values for upstream validation.
+    headers["anthropic-beta"] = ",".join(dict.fromkeys(
+        beta.strip() for beta in (client_beta + "," + headers["anthropic-beta"]).split(",")
+        if beta.strip()
+    ))
+    return headers
 
 # ============================================================
 # Flask 路由
@@ -369,9 +408,21 @@ def proxy_messages():
             or not isinstance(block.get("text"), str) for block in system
         )):
             raise ValueError("system must be a string or an array of text blocks")
+        if UPSTREAM_PROVIDER == "bedrock":
+            from bedrock_backend import invoke
+            return invoke(body, UPSTREAM_TIMEOUT)
         if SYSTEM_PROMPT_MODE == "legacy" and system and not any(m["role"] == "user" for m in messages):
             raise ValueError("Legacy system migration requires a user message")
         reverse = replace_tools(body)
+        is_haiku = body["model"].startswith("claude-haiku-")
+        if is_haiku or body["model"].startswith(("claude-sonnet-", "claude-fable-")):
+            body.pop("speed", None)
+        elif FORCE_FAST_OPUS:
+            body["model"] = FAST_OPUS_MODEL
+            body["speed"] = "fast"
+        elif FORCE_STANDARD_OPUS:
+            body["model"] = FAST_OPUS_MODEL
+            body.pop("speed", None)
         body_bytes = inject_system_and_cch(body)
     except (ValueError, UnicodeError) as exc:
         return api_error(str(exc), 400, "invalid_request_error")
@@ -383,7 +434,12 @@ def proxy_messages():
     if DEBUG:
         dump_debug(raw)
         dump_debug(body_bytes)
-    headers = build_headers(access_token)
+    headers = build_headers(access_token, request.headers.get("anthropic-beta", ""))
+    if is_haiku:
+        headers["anthropic-beta"] = ",".join(
+            beta for beta in headers["anthropic-beta"].split(",")
+            if beta != "context-1m-2025-08-07"
+        )
     is_stream = body.get("stream", False)
     if is_stream:
         headers["Accept"] = "text/event-stream"
@@ -424,6 +480,13 @@ def proxy_messages():
 
 @app.route("/health")
 def health():
+    if UPSTREAM_PROVIDER == "bedrock":
+        from bedrock_backend import client
+        try:
+            client(UPSTREAM_TIMEOUT)
+            return {"status": "configured", "provider": "bedrock", "upstream_verified": False}
+        except Exception:
+            return api_error("Bedrock configuration unavailable", 503)
     try:
         cred = load_credentials()
         remaining = (cred.get("expiresAt", 0) / 1000 - time.time()) / 3600
@@ -432,6 +495,9 @@ def health():
         return api_error("OAuth credentials unavailable", 503)
 
 if __name__ == "__main__":
+    if UPSTREAM_PROVIDER == "bedrock":
+        app.run(host=HOST, port=PORT, debug=False)
+        sys.exit(0)
     print(f"=== Claude Max → API 代理网关 v3 ===")
     print(f"CC Version: {CC_FULL_VERSION}")
     print()

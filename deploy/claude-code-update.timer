@@ -1,0 +1,10 @@
+[Unit]
+Description=Schedule Claude Code update checks
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 UTC
+Persistent=true
+Unit=claude-code-update.service
+
+[Install]
+WantedBy=timers.target

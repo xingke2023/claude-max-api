@@ -52,6 +52,7 @@ python3 proxy.py
 | `PORT` | `8899` | 直接运行 Python 时的监听端口 |
 | `HOST` | `127.0.0.1` | 监听地址；非回环地址必须配置 API Key |
 | `PROXY_API_KEY` | 空 | 代理入口密钥；公网部署必须设置 |
+| `PROXY_API_KEY_SECONDARY` | 空 | 可选的第二把代理入口密钥 |
 | `SYSTEM_PROMPT_MODE` | `legacy` | `legacy` 迁移 system；`preserve` 原样保留 system |
 | `REFRESH_TIMEOUT` | `60` | 凭证刷新超时（秒） |
 | `UPSTREAM_TIMEOUT` | `300` | 上游读取超时（秒） |
@@ -67,7 +68,7 @@ DEBUG=1 python3 proxy.py
 
 ## 在第三方工具中使用
 
-将 API Base URL 设置为 `http://localhost:8899`，本地未配置 `PROXY_API_KEY` 时 API Key 可随意填写；配置后必须填写该密钥，支持 `x-api-key` 或 `Authorization: Bearer`。上游仍使用本地 OAuth token。
+将 API Base URL 设置为 `http://localhost:8899`。可通过 `x-api-key` 或 `Authorization: Bearer` 传入任一已配置的代理入口密钥。两个密钥都留空时，本地代理不校验 API Key。
 
 ## 关于 Extra Usage
 
@@ -87,6 +88,8 @@ DEBUG=1 python3 proxy.py
 - `_remove`、`_padding` 不再执行：保留客户端声明的工具，不注入客户端无法执行的工具。
 
 ## System Prompt 处理
+
+网关默认添加顶层 `cache_control={"type":"ephemeral"}`，启用 5 分钟自动 prompt 缓存，覆盖完整对话并随历史增长移动缓存断点。保留客户端提供的缓存设置；legacy 模式若移除 system 缓存标记且无其他标记，则补上自动缓存。实际命中以响应 `usage.cache_read_input_tokens` 为准，首次写入或未满足模型最小缓存长度时可能为 0。
 
 默认 `SYSTEM_PROMPT_MODE=legacy` 保留历史兼容行为：将原始 system prompt 移入第一条 user message，system 使用客户端标识。这会改变指令优先级并丢失原 system 块的缓存属性。
 
@@ -128,3 +131,39 @@ DEBUG=1 python3 proxy.py
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
 ```
+
+## Claude Code 自动更新部署
+
+`deploy/claude-code-update.timer` 每天 UTC 04:00 唤醒更新服务。
+`deploy/update-claude-code.sh` 在上次成功检查后满 72 小时时才查询 npm 最新版，
+有新版才安装，并在安装后的 `claude --version` 检查成功后重启运行中的代理。
+服务使用 `/var/lib/claude-code-update/last-success` 记录检查时间，失败不推进时间。
+定时器开机自动启动，关机错过的任务在开机后补跑。
+脚本安装到 `/usr/local/sbin/update-claude-code`，两个 unit 安装到 `/etc/systemd/system/`。
+日志：`sudo journalctl -u claude-code-update.service`。
+停用：`sudo systemctl disable --now claude-code-update.timer`。
+
+## Opus 速度配置
+
+在 `.env` 设置 `FORCE_FAST_OPUS=true` 和 `FAST_OPUS_MODEL=claude-opus-5-5`，
+重启服务后，所有 `/v1/messages` 请求（含流式）会覆盖客户端模型和速度，
+使用指定 Opus 模型及 `speed=fast`。此模式仅支持 OAuth 上游，按额外付费额度计费，
+不包含在 Max 订阅额度内。上游权限、余额或限流错误会原样返回，不自动降速。
+设置 `FORCE_FAST_OPUS=false` 并重启可恢复客户端选择。
+如需统一使用一般速度的 Opus，设置 `FORCE_FAST_OPUS=false`、
+`FORCE_STANDARD_OPUS=true` 并重启；模型仍由 `FAST_OPUS_MODEL` 指定，
+客户端传入的快速模式参数会被移除。两个强制模式不能同时开启。
+
+## Bedrock 配置
+
+设置 `UPSTREAM_PROVIDER=bedrock`，并在 `.env` 中配置 `AWS_REGION` 和
+`AWS_BEARER_TOKEN_BEDROCK`（也支持 AWS SDK 默认 IAM 凭证链）。重启服务后生效。
+Bedrock 模式保留原始 system 和工具名称，不执行 OAuth 身份注入或工具映射。
+支持普通 Messages 响应和 SSE 流式响应；调用按 AWS Bedrock 计费。
+
+客户端可使用 `claude-sonnet-4-6`、`claude-opus-4-6`、
+`claude-haiku-4-5-20251001`，或直接填写 Bedrock 模型/推理配置 ID、ARN。
+其他模型通过 `BEDROCK_MODEL_MAP` JSON 对象配置映射。
+`/health` 的 `configured` 仅表示配置可加载，不代表上游权限或额度已验证。
+
+实现参考：[AWS InvokeModel 流式接口](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-runtime/client/invoke_model_with_response_stream.html)。

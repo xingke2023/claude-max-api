@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Claude Code updates every three days
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+StateDirectory=claude-code-update
+ExecStart=/usr/local/sbin/update-claude-code
+TimeoutStartSec=15min

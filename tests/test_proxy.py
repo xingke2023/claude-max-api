@@ -28,6 +28,43 @@ class ProxyTests(unittest.TestCase):
         with patch.object(proxy, 'load_credentials', return_value={'expiresAt': (time.time()+600)*1000}):
             self.assertEqual(self.client.get('/health', headers={'Authorization': 'Bearer test-secret'}).status_code, 200)
 
+    def test_force_fast_opus_overrides_client_for_stream_and_json(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                resp = Mock(status_code=429, headers={'content-type': 'application/json'})
+                resp.content = b'{"type":"error","error":{"type":"rate_limit_error"}}'
+                with patch.object(proxy, 'FORCE_FAST_OPUS', True), patch.object(proxy, 'get_access_token', return_value='oauth'), patch.object(proxy.requests, 'post', return_value=resp) as post:
+                    result = self.post({**self.body, 'stream': stream, 'speed': 'standard'})
+                sent = json.loads(post.call_args.kwargs['data'])
+                self.assertEqual(sent['model'], proxy.FAST_OPUS_MODEL)
+                self.assertEqual(sent['speed'], 'fast')
+                self.assertIn('fast-mode-2026-02-01', post.call_args.kwargs['headers']['anthropic-beta'])
+                self.assertEqual(result.status_code, 429)
+                post.assert_called_once()
+
+    def test_client_betas_and_new_fields_reach_upstream(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                body = copy.deepcopy(self.body)
+                body['stream'] = stream
+                body['messages'][0]['output_config'] = {'effort': 'low'}
+                body['thinking'] = {'type': 'adaptive', 'display': 'updates'}
+                self.headers['anthropic-beta'] = ('per-turn-control-2026-07-01,'
+                    'thinking-display-updates-2026-08-18,nonexistent-beta-2099-01-01,'
+                    'effort-2025-11-24,per-turn-control-2026-07-01')
+                resp = Mock(status_code=400, headers={'content-type': 'application/json'})
+                resp.content = b'{"type":"error","error":{"message":"unknown beta"}}'
+                with patch.object(proxy, 'get_access_token', return_value='oauth'), patch.object(proxy.requests, 'post', return_value=resp) as post:
+                    self.assertEqual(self.post(body).status_code, 400)
+                args = post.call_args.kwargs
+                betas = args['headers']['anthropic-beta'].split(',')
+                self.assertEqual(len(betas), len(set(betas)))
+                for beta in self.headers['anthropic-beta'].split(',') + ['oauth-2025-04-20']:
+                    self.assertIn(beta, betas)
+                sent = json.loads(args['data'])
+                self.assertEqual(sent['messages'][0]['output_config'], {'effort': 'low'})
+                self.assertEqual(sent['thinking'], body['thinking'])
+
     def test_invalid_requests_do_not_use_credentials(self):
         with patch.object(proxy, 'get_access_token') as token:
             for body in [[], {}, {**self.body, 'stream': 'yes'}, {**self.body, 'messages': [{'role': [], 'content': 'hi'}]}, {**self.body, 'tools': [None]},
@@ -77,6 +114,33 @@ class ProxyTests(unittest.TestCase):
         result = proxy.remap_response(data, reverse)['content'][0]
         self.assertEqual(result['name'], 'exec')
         self.assertEqual(result['input']['name'], 'Bash')
+
+    def test_server_tools_reach_upstream_unchanged(self):
+        for server_tool in (
+            {'type': 'web_search_20250305', 'name': 'web_search', 'max_uses': 1},
+            {'type': 'web_fetch_20250910', 'name': 'web_fetch', 'max_uses': 2},
+        ):
+            with self.subTest(tool=server_tool['name']):
+                history = {'type': 'server_tool_use', 'id': 'srvtoolu_example',
+                           'name': server_tool['name'], 'input': {}}
+                choice = {'type': 'tool', 'name': server_tool['name']}
+                body = {
+                    **self.body,
+                    'messages': self.body['messages'] + [{'role': 'assistant', 'content': [history]}],
+                    'tools': [server_tool, {'type': 'custom', 'name': 'exec', 'input_schema': {}}],
+                    'tool_choice': choice,
+                }
+                response = Mock(status_code=200, headers={'content-type': 'application/json'})
+                response.content = b'{"content":[]}'
+                with patch.object(proxy, 'get_access_token', return_value='oauth'), patch.object(
+                    proxy.requests, 'post', return_value=response,
+                ) as post:
+                    self.assertEqual(self.post(body).status_code, 200)
+                sent = json.loads(post.call_args.kwargs['data'])
+                self.assertEqual(sent['tools'][0], server_tool)
+                self.assertEqual(sent['tools'][1]['name'], 'Bash')
+                self.assertEqual(sent['tool_choice'], choice)
+                self.assertEqual(sent['messages'][-1]['content'], [history])
 
     def test_native_tools_and_collisions(self):
         body = {**self.body, 'tools': [{'name': 'Bash'}]}
@@ -149,6 +213,17 @@ class ProxyTests(unittest.TestCase):
             result = json.loads(proxy.inject_system_and_cch(body))
             self.assertIn('instructions', result['messages'][0]['content'])
             self.assertIn('Claude Code', result['system'][1]['text'])
+
+    def test_automatic_caching_and_client_breakpoints(self):
+        for mode in ('legacy', 'preserve'):
+            with patch.object(proxy, 'SYSTEM_PROMPT_MODE', mode):
+                result = json.loads(proxy.inject_system_and_cch(copy.deepcopy(self.body)))
+                self.assertEqual(result['cache_control'], {'type': 'ephemeral'})
+                body = copy.deepcopy(self.body)
+                body['messages'][0]['content'] = [{'type': 'text', 'text': 'hi', 'cache_control': {'type': 'ephemeral', 'ttl': '1h'}}]
+                result = json.loads(proxy.inject_system_and_cch(body))
+                self.assertNotIn('cache_control', result)
+                self.assertEqual(result['messages'][0]['content'][0]['cache_control']['ttl'], '1h')
 
 
 if __name__ == '__main__':
